@@ -5,15 +5,17 @@ import sys
 from apprise import Apprise
 from paho.mqtt.client import MQTTMessage
 
+# Thresholds for intelligent alerts
 THRESHOLDS = {
-    "temperature": {"high": 30.0, "low": 0.0},
-    "humidity": {"low": 20.0},
+    "temperature": {"high": 30.0, "low": 15.0},
+    "humidity": {"low": 20.0, "high": 60.0},
     "pressure": {"high": 101325.0, "low": 98000.0},
     "sound": {"high": 70.0},
     "light": {"high": 90.0},
     "rssi": {"low": -70},
 }
 
+# Pushsafer private key
 PUSHSAFER_KEY = "psafer://OO3pYKxoV4r7MVwRAEf1"
 
 def send_notification(title: str, body: str):
@@ -24,9 +26,9 @@ def send_notification(title: str, body: str):
     apobj.add(PUSHSAFER_KEY)
 
     if apobj.notify(title=title, body=body):
-        logger.info("Notification successfully sent.")
+        logger.info(f"Notification successfully sent: {title}")
     else:
-        logger.error("Failed to send the notification.")
+        logger.error(f"Failed to send the notification: {title}")
 
 def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
     """
@@ -44,22 +46,59 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
 
             if name in THRESHOLDS:
                 threshold = THRESHOLDS[name]
+                alert_message = None
+
+                # High threshold check
                 if "high" in threshold and value > threshold["high"]:
                     logger.warning(f"High {name} detected: {value} {units}")
-                    send_notification(
-                        title=f"High {name.capitalize()} Alert",
-                        body=f"{name.capitalize()} exceeded threshold: {value} {units}"
-                    )
+                    alert_message = get_alert_message(name, value, units, "high")
+
+                # Low threshold check
                 elif "low" in threshold and value < threshold["low"]:
                     logger.warning(f"Low {name} detected: {value} {units}")
+                    alert_message = get_alert_message(name, value, units, "low")
+
+                # Send notification if an alert is triggered
+                if alert_message:
                     send_notification(
-                        title=f"Low {name.capitalize()} Alert",
-                        body=f"{name.capitalize()} fell below threshold: {value} {units}"
+                        title=f"{name.capitalize()} Alert",
+                        body=alert_message
                     )
+
     except json.JSONDecodeError:
         logger.error(f"Failed to decode JSON payload: {msg.payload}")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
+
+def get_alert_message(name: str, value: float, units: str, level: str) -> str:
+    """
+    Generates a detailed alert message with added value.
+    """
+    messages = {
+        "temperature": {
+            "high": f"The temperature is {value} {units}, exceeding the threshold. Ensure proper ventilation or cooling to maintain comfort and avoid overheating.",
+            "low": f"The temperature is {value} {units}, below the threshold. Consider using a heater or wearing warm clothing.",
+        },
+        "humidity": {
+            "high": f"Humidity has risen to {value} {units}. High humidity may cause discomfort. Consider using a dehumidifier.",
+            "low": f"Humidity has dropped to {value} {units}. Dry air may cause skin or respiratory discomfort. Use a humidifier or increase ventilation.",
+        },
+        "pressure": {
+            "high": f"Atmospheric pressure is {value} {units}, exceeding the normal range. Ensure ventilation in enclosed spaces.",
+            "low": f"Atmospheric pressure is {value} {units}. This may indicate stormy weather. Stay updated on weather forecasts.",
+        },
+        "sound": {
+            "high": f"High sound levels detected: {value} {units}. Prolonged exposure may cause discomfort. Consider reducing noise for a calmer environment.",
+        },
+        "light": {
+            "high": f"Intense light levels detected: {value} {units}. Consider reducing light exposure, especially during nighttime, for better sleep quality.",
+        },
+        "rssi": {
+            "low": f"Signal strength is weak: {value} {units}. Consider checking your network connection or moving closer to the Wi-Fi router.",
+        },
+    }
+
+    return messages.get(name, {}).get(level, f"{name.capitalize()} is at {value} {units}.")
 
 def handle_command(client: mqtt.Client, userdata, msg: MQTTMessage):
     """
