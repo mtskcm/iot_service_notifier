@@ -5,6 +5,7 @@ import sys
 from apprise import Apprise
 from paho.mqtt.client import MQTTMessage
 
+
 # Thresholds for intelligent alerts
 THRESHOLDS = {
     "temperature": {"high": 30.0, "low": 15.0},
@@ -38,6 +39,8 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         data = json.loads(msg.payload.decode("utf-8"))
         logger.info(f"Received sensor data: {data}")
 
+
+
         # Iterate through metrics and check thresholds
         for metric in data.get("metrics", []):
             name = metric["name"]
@@ -69,6 +72,27 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         logger.error(f"Failed to decode JSON payload: {msg.payload}")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
+
+def analyze_trend(data):
+    """
+    Analyzes the trend of historical data.
+    :param data: List of historical data points.
+    :return: Trend direction (positive/negative).
+    """
+    if len(data) < 2:
+        return 0
+    return data[-1]["value"] - data[0]["value"]
+
+def predict_future_value(current_value, trend, time_interval=1):
+    """
+    Predicts a future value based on the current value and trend.
+    :param current_value: Current value of the metric.
+    :param trend: Trend direction (positive/negative).
+    :param time_interval: Time interval for prediction (in hours).
+    :return: Predicted value.
+    """
+    return current_value + trend * time_interval
+
 
 def get_alert_message(name: str, value: float, units: str, level: str) -> str:
     """
@@ -132,8 +156,8 @@ def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties):
     logger.debug(f"Connected with result code {reason_code}")
 
     # Subscribe to sensor data topics and command topics
-    client.subscribe("gateway/+/+/#")  # Subscribes to all sensor topics dynamically
-    client.message_callback_add("gateway/+/+/#", handle_sensor_data)
+    client.subscribe("kpi/kronos/+/zen-e6614103e7698839/#")  # Subscribes to all sensor topics dynamically
+    client.message_callback_add("kpi/kronos/+/zen-e6614103e7698839/#", handle_sensor_data)
 
     client.subscribe("services/notifier/mk137vq/cmd")
     client.message_callback_add("services/notifier/mk137vq/cmd", handle_command)
@@ -146,7 +170,7 @@ def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties):
         retain=True,
     )
     logger.info(
-        "Subscribed to topics: gateway/+/+/#, services/notifier/mk137vq/cmd"
+        "Subscribed to topics: kpi/kronos/+/zen-e6614103e7698839/#, services/notifier/mk137vq/cmd"
     )
 
 def on_disconnect(client: mqtt.Client, userdata, reason_code):
