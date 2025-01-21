@@ -1,6 +1,7 @@
 from loguru import logger
 import paho.mqtt.client as mqtt
 import json
+from datetime import datetime
 from apprise import Apprise
 from paho.mqtt.client import MQTTMessage
 from models import Settings, Notification
@@ -31,6 +32,109 @@ def save_to_influx(metric_name, value, unit, timestamp):
         logger.info(f"Saved {metric_name} to InfluxDB: {value} {unit} at {timestamp}")
     except Exception as e:
         logger.error(f"Error saving to InfluxDB: {e}")
+
+def calculate_sleep_conditions():
+    """
+    Analyzes sleep conditions based on stored data in InfluxDB.
+    """
+    try:
+        query = f"""
+        from(bucket: "{settings.influxdb_bucket}")
+          |> range(start: -24h)
+          |> filter(fn: (r) => r._field == "value")
+        """
+        result = influx_client.query_api().query(query, org=settings.influxdb_org)
+        data = {}
+
+        # Organize data by metric
+        for table in result:
+            for record in table.records:
+                metric = record.get_measurement()
+                value = record.get_value()
+                if metric not in data:
+                    data[metric] = []
+                data[metric].append(value)
+
+        insights = {}
+
+        # Analyze metrics
+        for metric, values in data.items():
+            average = sum(values) / len(values)
+            above_threshold = sum(1 for v in values if v > THRESHOLDS[metric].get("high", float('inf')))
+            below_threshold = sum(1 for v in values if v < THRESHOLDS[metric].get("low", float('-inf')))
+
+            insights[metric] = {
+                "average": average,
+                "above_threshold": above_threshold,
+                "below_threshold": below_threshold,
+            }
+
+            logger.info(f"{metric.capitalize()} - Average: {average}, Above Threshold: {above_threshold}, Below Threshold: {below_threshold}")
+
+        return insights
+
+    except Exception as e:
+        logger.error(f"Error calculating sleep conditions: {e}")
+        return {}
+
+def calculate_environment_quality_index():
+    """
+    Calculates an index for sleep environment quality based on temperature, humidity, light, and sound.
+    """
+    try:
+        conditions = calculate_sleep_conditions()
+        if not conditions:
+            return None
+
+        # Weight factors for each metric
+        weights = {
+            "temperature": 0.3,
+            "humidity": 0.3,
+            "light": 0.2,
+            "sound": 0.2,
+        }
+
+        # Calculate quality index
+        quality_index = 0
+        for metric, weight in weights.items():
+            if metric in conditions:
+                average = conditions[metric]["average"]
+                if metric in THRESHOLDS:
+                    high = THRESHOLDS[metric].get("high", float('inf'))
+                    low = THRESHOLDS[metric].get("low", float('-inf'))
+                    deviation = max(0, average - high) + max(0, low - average)
+                    quality_index += deviation * weight
+
+        logger.info(f"Environment Quality Index: {quality_index}")
+        return quality_index
+
+    except Exception as e:
+        logger.error(f"Error calculating environment quality index: {e}")
+        return None
+
+def generate_sleep_report():
+    """
+    Generates a detailed sleep report based on historical data.
+    """
+    try:
+        conditions = calculate_sleep_conditions()
+        quality_index = calculate_environment_quality_index()
+
+        if conditions and quality_index is not None:
+            report = "Sleep Environment Report:\n"
+            for metric, data in conditions.items():
+                report += (
+                    f"- {metric.capitalize()}:\n"
+                    f"  - Average: {data['average']:.2f}\n"
+                    f"  - Above Threshold: {data['above_threshold']} times\n"
+                    f"  - Below Threshold: {data['below_threshold']} times\n"
+                )
+            report += f"\nOverall Quality Index: {quality_index:.2f} (Lower is better)\n"
+            logger.info(report)
+            send_notification("Sleep Environment Report", report)
+
+    except Exception as e:
+        logger.error(f"Error generating sleep report: {e}")
 
 def analyze_trends(metric_name, time_interval="6h"):
     query = f"""
@@ -76,13 +180,20 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         # Handle "status" messages separately
         if "status" in data:
             logger.info(f"Received status update: {data['status']}")
-            return  # Exit early as this is not sensor data
+            return
 
         # Validate timestamp
         timestamp = data.get("dt")
         if not timestamp:
             logger.error("Missing 'dt' in sensor data payload.")
-            return  # Skip processing this message
+            return
+
+        # Convert timestamp to datetime object
+        dt_object = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+        # Check if the time is midnight
+        if dt_object.hour == 0 and dt_object.minute == 0:
+            generate_sleep_report()
 
         # Iterate through metrics and check thresholds
         for metric in data.get("metrics", []):
@@ -143,7 +254,6 @@ def predict_future_value(current_value, trend, time_interval=1):
     """
     return current_value + trend * time_interval
 
-
 def get_alert_message(name: str, value: float, units: str, level: str) -> str:
     """
     Generates a detailed alert message with added value.
@@ -192,7 +302,6 @@ def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties):
     )
     logger.info(f"Published online status to {settings.status_topic}.")
 
-
 def on_disconnect(client: mqtt.Client, userdata, reason_code):
     logger.info(f"Disconnected with reason code {reason_code}")
 
@@ -217,8 +326,6 @@ def main():
 
     logger.info("Waiting for messages...")
     client.loop_forever()
-
-
 
 if __name__ == "__main__":
     main()
