@@ -42,6 +42,7 @@ def calculate_sleep_conditions():
         from(bucket: "{settings.influxdb_bucket}")
           |> range(start: -24h)
           |> filter(fn: (r) => r._field == "value")
+          |> filter(fn: (r) => r._measurement in ["temperature", "humidity", "light", "sound", "pressure"])
         """
         result = influx_client.query_api().query(query, org=settings.influxdb_org)
         data = {}
@@ -89,9 +90,9 @@ def calculate_environment_quality_index():
         # Weight factors for each metric
         weights = {
             "temperature": 0.3,
-            "humidity": 0.3,
-            "light": 0.2,
-            "sound": 0.2,
+            "humidity": 0.1,
+            "light": 0.3,
+            "sound": 0.3,
         }
 
         # Calculate quality index
@@ -233,26 +234,6 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         logger.error(f"Failed to decode JSON payload: {msg.payload}")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}")
-
-def analyze_trend(data):
-    """
-    Analyzes the trend of historical data.
-    :param data: List of historical data points.
-    :return: Trend direction (positive/negative).
-    """
-    if len(data) < 2:
-        return 0
-    return data[-1]["value"] - data[0]["value"]
-
-def predict_future_value(current_value, trend, time_interval=1):
-    """
-    Predicts a future value based on the current value and trend.
-    :param current_value: Current value of the metric.
-    :param trend: Trend direction (positive/negative).
-    :param time_interval: Time interval for prediction (in hours).
-    :return: Predicted value.
-    """
-    return current_value + trend * time_interval
 
 def get_alert_message(name: str, value: float, units: str, level: str) -> str:
     """
