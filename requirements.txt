@@ -3,3 +3,5 @@ loguru
 paho-mqtt
 pydantic
 pydantic-settings
+python-dotenv
+influxdb-client

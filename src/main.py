@@ -1,10 +1,13 @@
 from loguru import logger
 import paho.mqtt.client as mqtt
 import json
-import sys
 from apprise import Apprise
 from paho.mqtt.client import MQTTMessage
+from models import Settings, Notification
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
 
+settings = Settings()
 
 # Thresholds for intelligent alerts
 THRESHOLDS = {
@@ -15,16 +18,47 @@ THRESHOLDS = {
     "light": {"high": 90.0},
     "rssi": {"low": -70},
 }
+# Inicializácia klienta
+influx_client = InfluxDBClient(
+    url=settings.influxdb_url, token=settings.influxdb_token, org=settings.influxdb_org
+)
+write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
-# Pushsafer private key
-PUSHSAFER_KEY = "psafer://OO3pYKxoV4r7MVwRAEf1"
+def save_to_influx(metric_name, value, unit, timestamp):
+    try:
+        point = Point(metric_name).field("value", value).field("unit", unit).time(timestamp)
+        write_api.write(bucket=settings.influxdb_bucket, org=settings.influxdb_org, record=point)
+        logger.info(f"Saved {metric_name} to InfluxDB: {value} {unit} at {timestamp}")
+    except Exception as e:
+        logger.error(f"Error saving to InfluxDB: {e}")
+
+def analyze_trends(metric_name, time_interval="6h"):
+    query = f"""
+    from(bucket: "{settings.influxdb_bucket}")
+      |> range(start: -{time_interval})
+      |> filter(fn: (r) => r._measurement == "{metric_name}")
+      |> filter(fn: (r) => r._field == "value")
+    """
+    try:
+        result = influx_client.query_api().query(query, org=settings.influxdb_org)
+        values = [record.get_value() for table in result for record in table.records]
+
+        if len(values) < 2:
+            return 0  # Not enough data for trend analysis
+
+        trend = values[-1] - values[0]
+        logger.info(f"Trend for {metric_name}: {trend}")
+        return trend
+    except Exception as e:
+        logger.error(f"Error in analyze_trends query: {e}")
+        return 0
 
 def send_notification(title: str, body: str):
     """
     Sends a Pushsafer notification using Apprise.
     """
     apobj = Apprise(debug=True)
-    apobj.add(PUSHSAFER_KEY)
+    apobj.add(settings.pushsafer_key)
 
     if apobj.notify(title=title, body=body):
         logger.info(f"Notification successfully sent: {title}")
@@ -39,29 +73,45 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         data = json.loads(msg.payload.decode("utf-8"))
         logger.info(f"Received sensor data: {data}")
 
+        # Handle "status" messages separately
+        if "status" in data:
+            logger.info(f"Received status update: {data['status']}")
+            return  # Exit early as this is not sensor data
 
+        # Validate timestamp
+        timestamp = data.get("dt")
+        if not timestamp:
+            logger.error("Missing 'dt' in sensor data payload.")
+            return  # Skip processing this message
 
         # Iterate through metrics and check thresholds
         for metric in data.get("metrics", []):
             name = metric["name"]
             value = metric["value"]
-            units = metric["units"]
+            units = metric.get("units", "unknown")
 
+            # Save to InfluxDB
+            save_to_influx(name, value, units, timestamp)
+
+            # Analyze trends
+            trend = analyze_trends(name, time_interval="6h")
+            if abs(trend) > 5:
+                alert_message = f"Significant trend detected for {name}: {trend} {units}/hour"
+                send_notification(title=f"{name.capitalize()} Alert", body=alert_message)
+
+            # Check thresholds and send notifications
             if name in THRESHOLDS:
                 threshold = THRESHOLDS[name]
                 alert_message = None
 
-                # High threshold check
                 if "high" in threshold and value > threshold["high"]:
                     logger.warning(f"High {name} detected: {value} {units}")
                     alert_message = get_alert_message(name, value, units, "high")
 
-                # Low threshold check
                 elif "low" in threshold and value < threshold["low"]:
                     logger.warning(f"Low {name} detected: {value} {units}")
                     alert_message = get_alert_message(name, value, units, "low")
 
-                # Send notification if an alert is triggered
                 if alert_message:
                     send_notification(
                         title=f"{name.capitalize()} Alert",
@@ -124,54 +174,24 @@ def get_alert_message(name: str, value: float, units: str, level: str) -> str:
 
     return messages.get(name, {}).get(level, f"{name.capitalize()} is at {value} {units}.")
 
-def handle_command(client: mqtt.Client, userdata, msg: MQTTMessage):
-    """
-    Handles commands received on the topic services/notifier/mk137vq/cmd.
-    """
-    try:
-        command = json.loads(msg.payload.decode("utf-8"))
-        logger.info(f"Received command: {command}")
-
-        if command.get("cmd") == "shutdown":
-            logger.info("Shutting down the service as requested.")
-            client.publish(
-                "services/notifier/mk137vq/status",
-                json.dumps({"status": "offline"}),
-                qos=1,
-                retain=True,
-            )
-            client.disconnect()
-            client.loop_stop()
-            logger.info("Client disconnected and loop stopped. Exiting now.")
-            sys.exit(0)
-        else:
-            logger.warning(f"Unknown command received: {command}")
-
-    except json.JSONDecodeError:
-        logger.error(f"Failed to decode JSON payload: {msg.payload}")
-    except Exception as e:
-        logger.error(f"An error occurred while handling the command: {e}")
-
 def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties):
     logger.debug(f"Connected with result code {reason_code}")
 
-    # Subscribe to sensor data topics and command topics
-    client.subscribe("kpi/kronos/+/zen-e6614103e7698839/#")  # Subscribes to all sensor topics dynamically
-    client.message_callback_add("kpi/kronos/+/zen-e6614103e7698839/#", handle_sensor_data)
+    # Subscribe to all sensor data topics
+    topic = f"{settings.base_topic}+/zen-e6614103e7698839/#"
+    client.subscribe(topic)
+    client.message_callback_add(topic, handle_sensor_data)
+    logger.info(f"Subscribed to topic: {topic}")
 
-    client.subscribe("services/notifier/mk137vq/cmd")
-    client.message_callback_add("services/notifier/mk137vq/cmd", handle_command)
-
-    # Publish status "online"
+    # Publish "online" status to the status topic
     client.publish(
-        "services/notifier/mk137vq/status",
+        settings.status_topic,
         json.dumps({"status": "online"}),
         qos=1,
         retain=True,
     )
-    logger.info(
-        "Subscribed to topics: kpi/kronos/+/zen-e6614103e7698839/#, services/notifier/mk137vq/cmd"
-    )
+    logger.info(f"Published online status to {settings.status_topic}.")
+
 
 def on_disconnect(client: mqtt.Client, userdata, reason_code):
     logger.info(f"Disconnected with reason code {reason_code}")
@@ -181,22 +201,23 @@ def main():
 
     # Set Last Will and Testament (LWT) for status topic
     client.will_set(
-        "services/notifier/mk137vq/status",
+        settings.status_topic,
         json.dumps({"status": "offline"}),
         qos=1,
         retain=True,
     )
 
-    # MQTT credentials
-    client.username_pw_set("maker", "mother.mqtt.password")
+    # Set MQTT credentials
+    client.username_pw_set(settings.user, settings.password)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
 
     # Connect to the broker
-    client.connect("147.232.205.176", 1883, 60)
+    client.connect(settings.broker, settings.port, 60)
 
     logger.info("Waiting for messages...")
     client.loop_forever()
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  notifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: notifier
+    ports:
+      - "1883:1883"  # MQTT port
+    volumes:
+      - ./src:/app/src
+      - ./local.env:/app/src/local.env:ro
+    env_file:
+      - local.env
+    restart: always
+    depends_on:
+      - influxdb
+      - mqtt
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      INFLUXDB_ADMIN_USER: admin
+      INFLUXDB_ADMIN_PASSWORD: admin123
+      INFLUXDB_ORG: notifier_org
+      INFLUXDB_BUCKET: SleepTracking
+      INFLUXDB_INIT_MODE: setup
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    restart: always
+
+  mqtt:
+    image: eclipse-mosquitto:latest
+    container_name: mqtt
+    ports:
+      - "1883:1883"
+      - "9001:9001"  # WebSocket port
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    restart: always
+
+volumes:
+  influxdb-data:
