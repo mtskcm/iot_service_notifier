@@ -10,13 +10,13 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 settings = Settings()
 
-# Thresholds for intelligent alerts
+# Thresholds pre inteligentne notifikacie
 THRESHOLDS = {
-    "temperature": {"high": 30.0, "low": 15.0},
-    "humidity": {"low": 20.0, "high": 60.0},
-    "pressure": {"high": 101325.0, "low": 98000.0},
-    "sound": {"high": 70.0},
-    "light": {"high": 90.0},
+    "temperature": {"high": 30.0, "low": 15.0, "trend_threshold": 10.0},
+    "humidity": {"low": 20.0, "high": 60.0, "trend_threshold": 20.0},
+    "pressure": {"high": 101325.0, "low": 98000.0, "trend_threshold": 2000.0},
+    "sound": {"high": 70.0, "trend_threshold": 40.0},
+    "light": {"high": 90.0, "trend_threshold": 30.0},
     "rssi": {"low": -70},
 }
 # Inicializácia klienta
@@ -34,9 +34,6 @@ def save_to_influx(metric_name, value, unit, timestamp):
         logger.error(f"Error saving to InfluxDB: {e}")
 
 def calculate_sleep_conditions():
-    """
-    Analyzes sleep conditions based on stored data in InfluxDB.
-    """
     try:
         query = f"""
         from(bucket: "{settings.influxdb_bucket}")
@@ -46,7 +43,7 @@ def calculate_sleep_conditions():
         result = influx_client.query_api().query(query, org=settings.influxdb_org)
         data = {}
 
-        # Organize data by metric
+        # zoradenie dat podla metriky
         for table in result:
             for record in table.records:
                 metric = record.get_measurement()
@@ -57,7 +54,7 @@ def calculate_sleep_conditions():
 
         insights = {}
 
-        # Analyze metrics
+        # analyza metrik
         for metric, values in data.items():
             average = sum(values) / len(values)
             above_threshold = sum(1 for v in values if v > THRESHOLDS[metric].get("high", float('inf')))
@@ -78,15 +75,13 @@ def calculate_sleep_conditions():
         return {}
 
 def calculate_environment_quality_index():
-    """
-    Calculates an index for sleep environment quality based on temperature, humidity, light, and sound.
-    """
+
     try:
         conditions = calculate_sleep_conditions()
         if not conditions:
             return None
 
-        # Weight factors for each metric
+        # vahy pre kazdu metriku
         weights = {
             "temperature": 0.3,
             "humidity": 0.1,
@@ -94,7 +89,7 @@ def calculate_environment_quality_index():
             "sound": 0.3,
         }
 
-        # Calculate quality index
+        # vypocet indexu kvality
         quality_index = 0
         for metric, weight in weights.items():
             if metric in conditions:
@@ -113,9 +108,7 @@ def calculate_environment_quality_index():
         return None
 
 def generate_sleep_report():
-    """
-    Generates a detailed sleep report based on historical data.
-    """
+
     try:
         conditions = calculate_sleep_conditions()
         quality_index = calculate_environment_quality_index()
@@ -137,6 +130,10 @@ def generate_sleep_report():
         logger.error(f"Error generating sleep report: {e}")
 
 def analyze_trends(metric_name, time_interval="6h"):
+    """
+    Analyze trends for a specific metric by checking the difference between the oldest
+    and newest values in a given time range.
+    """
     query = f"""
     from(bucket: "{settings.influxdb_bucket}")
       |> range(start: -{time_interval})
@@ -148,19 +145,19 @@ def analyze_trends(metric_name, time_interval="6h"):
         values = [record.get_value() for table in result for record in table.records]
 
         if len(values) < 2:
-            return 0  # Not enough data for trend analysis
+            logger.info(f"Not enough data points for trend analysis of {metric_name}.")
+            return 0  # No trend can be calculated
 
+        # Calculate the trend as the difference between the newest and oldest values
         trend = values[-1] - values[0]
         logger.info(f"Trend for {metric_name}: {trend}")
         return trend
     except Exception as e:
-        logger.error(f"Error in analyze_trends query: {e}")
+        logger.error(f"Error during trend analysis for {metric_name}: {e}")
         return 0
 
 def send_notification(title: str, body: str):
-    """
-    Sends a Pushsafer notification using Apprise.
-    """
+
     apobj = Apprise(debug=True)
     apobj.add(settings.pushsafer_key)
 
@@ -170,64 +167,57 @@ def send_notification(title: str, body: str):
         logger.error(f"Failed to send the notification: {title}")
 
 def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
-    """
-    Handles sensor data received from topics.
-    """
+
     try:
         data = json.loads(msg.payload.decode("utf-8"))
         logger.info(f"Received sensor data: {data}")
 
-        # Handle "status" messages separately
+        # samostatne spracovanie statusu
         if "status" in data:
             logger.info(f"Received status update: {data['status']}")
             return
 
-        # Validate timestamp
+        # validacia timestampu
         timestamp = data.get("dt")
         if not timestamp:
             logger.error("Missing 'dt' in sensor data payload.")
             return
 
-        # Convert timestamp to datetime object
+        # koverzia timestampu na datetime
         dt_object = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 
-        # Check if the time is midnight
-        if dt_object.hour == 0 and dt_object.minute == 0:
+        # kontrola ci je 0800 casu
+        if dt_object.hour == 0 and dt_object.minute == 8:
             generate_sleep_report()
 
-        # Iterate through metrics and check thresholds
+        # kontrola hranicnyhc hodnot
         for metric in data.get("metrics", []):
             name = metric["name"]
             value = metric["value"]
             units = metric.get("units", "unknown")
 
-            # Save to InfluxDB
             save_to_influx(name, value, units, timestamp)
 
-            # Analyze trends
-            trend = analyze_trends(name, time_interval="6h")
-            if abs(trend) > 5:
-                alert_message = f"Significant trend detected for {name}: {trend} {units}/hour"
-                send_notification(title=f"{name.capitalize()} Alert", body=alert_message)
+            # analyza trendu
+            trend = analyze_trends(name)
+            if abs(trend) > THRESHOLDS.get(name, {}).get("trend_threshold", 5):
+                send_notification(
+                    f"{name.capitalize()} Trend Alert",
+                    f"A significant trend was detected in {name}: {trend} {units}.",
+                )
 
-            # Check thresholds and send notifications
-            if name in THRESHOLDS:
-                threshold = THRESHOLDS[name]
-                alert_message = None
-
-                if "high" in threshold and value > threshold["high"]:
-                    logger.warning(f"High {name} detected: {value} {units}")
-                    alert_message = get_alert_message(name, value, units, "high")
-
-                elif "low" in threshold and value < threshold["low"]:
-                    logger.warning(f"Low {name} detected: {value} {units}")
-                    alert_message = get_alert_message(name, value, units, "low")
-
-                if alert_message:
-                    send_notification(
-                        title=f"{name.capitalize()} Alert",
-                        body=alert_message
-                    )
+            # posielanie notifikacii na zaklade hranicnych hodnot
+            thresholds = THRESHOLDS.get(name, {})
+            if "high" in thresholds and value > thresholds["high"]:
+                send_notification(
+                    f"{name.capitalize()} High Alert",
+                    f"The {name} value is too high: {value} {units} (Threshold: {thresholds['high']}).",
+                )
+            elif "low" in thresholds and value < thresholds["low"]:
+                send_notification(
+                    f"{name.capitalize()} Low Alert",
+                    f"The {name} value is too low: {value} {units} (Threshold: {thresholds['low']}).",
+                )
 
     except json.JSONDecodeError:
         logger.error(f"Failed to decode JSON payload: {msg.payload}")
@@ -235,9 +225,7 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         logger.error(f"An unexpected error occurred: {e}")
 
 def get_alert_message(name: str, value: float, units: str, level: str) -> str:
-    """
-    Generates a detailed alert message with added value.
-    """
+
     messages = {
         "temperature": {
             "high": f"The temperature is {value} {units}, exceeding the threshold. Ensure proper ventilation or cooling to maintain comfort and avoid overheating.",
@@ -267,13 +255,13 @@ def get_alert_message(name: str, value: float, units: str, level: str) -> str:
 def on_connect(client: mqtt.Client, userdata, flags, reason_code, properties):
     logger.debug(f"Connected with result code {reason_code}")
 
-    # Subscribe to all sensor data topics
+    # subscribe na vsetky topics dynamicky
     topic = f"{settings.base_topic}+/zen-e6614103e7698839/#"
     client.subscribe(topic)
     client.message_callback_add(topic, handle_sensor_data)
     logger.info(f"Subscribed to topic: {topic}")
 
-    # Publish "online" status to the status topic
+    # publish online status
     client.publish(
         settings.status_topic,
         json.dumps({"status": "online"}),
@@ -288,7 +276,7 @@ def on_disconnect(client: mqtt.Client, userdata, reason_code):
 def main():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-    # Set Last Will and Testament (LWT) for status topic
+    # set last will
     client.will_set(
         settings.status_topic,
         json.dumps({"status": "offline"}),
@@ -296,12 +284,12 @@ def main():
         retain=True,
     )
 
-    # Set MQTT credentials
+    # set MQTT credentials
     client.username_pw_set(settings.user, settings.password)
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
 
-    # Connect to the broker
+    # pripojenie na broker
     client.connect(settings.broker, settings.port, 60)
 
     logger.info("Waiting for messages...")
