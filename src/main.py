@@ -187,7 +187,7 @@ def handle_sensor_data(client: mqtt.Client, userdata, msg: MQTTMessage):
         dt_object = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
 
         # kontrola ci je 0800 casu
-        if dt_object.hour == 0 and dt_object.minute == 8:
+        if dt_object.hour == 8 and dt_object.minute == 0:
             generate_sleep_report()
 
         # kontrola hranicnyhc hodnot
