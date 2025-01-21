@@ -42,7 +42,6 @@ def calculate_sleep_conditions():
         from(bucket: "{settings.influxdb_bucket}")
           |> range(start: -24h)
           |> filter(fn: (r) => r._field == "value")
-          |> filter(fn: (r) => r._measurement in ["temperature", "humidity", "light", "sound", "pressure"])
         """
         result = influx_client.query_api().query(query, org=settings.influxdb_org)
         data = {}
